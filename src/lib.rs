@@ -312,10 +312,10 @@ impl<T: Sync + Send + 'static> Nucleo<T> {
         num_threads: Option<usize>,
         columns: u32,
     ) -> Self {
-        let (pool, worker) = Worker::new(num_threads, config, notify.clone(), columns);
+        let (pool, worker) = Worker::new(num_threads, config, columns);
         Self {
             canceled: worker.canceled.clone(),
-            should_notify: worker.should_notify.clone(),
+            should_notify: Arc::new(AtomicBool::new(false)),
             items: worker.items.clone(),
             pool,
             pattern: MultiPattern::new(columns as usize),
@@ -413,8 +413,11 @@ impl<T: Sync + Send + 'static> Nucleo<T> {
             self.canceled.store(true, atomic::Ordering::Relaxed);
             self.worker.lock_arc()
         } else {
+            // Pairs with the fence after the worker unlocks: a worker that
+            // finishes after a failed try_lock always sees should_notify.
+            self.should_notify.store(true, Ordering::Relaxed);
+            atomic::fence(Ordering::SeqCst);
             let Some(worker) = self.worker.try_lock_arc_for(Duration::from_millis(timeout)) else {
-                self.should_notify.store(true, Ordering::Release);
                 return Status {
                     changed: false,
                     running: true,
@@ -435,15 +438,22 @@ impl<T: Sync + Send + 'static> Nucleo<T> {
         if running {
             inner.pattern.clone_from(&self.pattern);
             self.canceled.store(false, atomic::Ordering::Relaxed);
-            if !canceled {
-                self.should_notify.store(true, atomic::Ordering::Release);
-            }
             let cleared = self.state.cleared();
             if cleared {
                 inner.items = self.items.clone();
             }
-            self.pool
-                .spawn(move || unsafe { inner.run(status, cleared) })
+            let should_notify = self.should_notify.clone();
+            let notify = self.notify.clone();
+            self.pool.spawn(move || {
+                unsafe { inner.run(status, cleared) };
+                let was_canceled = inner.was_canceled;
+                drop(inner);
+                // Pairs with the fence in the try_lock path above.
+                atomic::fence(Ordering::SeqCst);
+                if !was_canceled && should_notify.load(Ordering::Relaxed) {
+                    notify();
+                }
+            })
         }
         Status { changed, running }
     }
